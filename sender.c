@@ -9,115 +9,120 @@
 #include <unistd.h>
 
 #include <tee_client_api.h>
-#include <sender_ta.h>
 
-// 定義目標主機資訊
-#define DEST_IP "192.168.1.100"  // 另一台主機的實際 IP
-#define DEST_PORT 5555           // 另一台主機 CA 監聽的連接埠
-#define MAX_SIG_SIZE 256         // 假設的簽章長度
+/* Define communication parameters */
+#define LISTEN_PORT 1234
+#define DEST_IP "192.168.1.100"
+#define DEST_PORT 5555
+#define MAX_SIG_SIZE 256
 
-int main(void)
-{
-	TEEC_Result res;
-	TEEC_Context ctx;
-	TEEC_Session sess;
-	TEEC_Operation op;
-	TEEC_UUID uuid = TA_SENDER_UUID;
-	uint32_t err_origin;
+int main(void) {
+    TEEC_Result res;
+    TEEC_Context ctx;
+    TEEC_Session sess;
+    TEEC_Operation op;
+    TEEC_UUID uuid = TA_NMEA_SIGN_UUID;
+    uint32_t err_origin;
 
-	int sockfd;
-	char buffer[1024];
-	uint8_t sign_buffer[MAX_SIG_SIZE];
-	char final_packet[1500]; // 組合後的封包緩衝區
-	struct sockaddr_in servaddr, cliaddr, dest_addr;
-	socklen_t len;
+    int sockfd;
+    char buffer[1024];
+    uint8_t sign_buffer[MAX_SIG_SIZE];
+    uint8_t modulus[256], exponent[4];
+    uint8_t final_packet[2048];
+    struct sockaddr_in servaddr, dest_addr;
 
-	/* 初始化 TEE Context & Session */
-	res = TEEC_InitializeContext(NULL, &ctx);
-	if(res != TEEC_SUCCESS) errx(1, "InitializeContext failed");
+    /* Initialize TEE */
+    res = TEEC_InitializeContext(NULL, &ctx);
+    if (res != TEEC_SUCCESS) errx(1, "InitializeContext failed");
 
-	res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
-	if(res != TEEC_SUCCESS) errx(1, "OpenSession failed");
+    res = TEEC_OpenSession(&ctx, &sess, &uuid, TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
+    if (res != TEEC_SUCCESS) errx(1, "OpenSession failed");
 
-	/* 準備 UDP Socket */
-	if((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0){
-		perror("socket creation failed");
-		return -1;
-	}
+    /* Key management */
 
-	// 設定本地監聽 (接收訊息)
-	memset(&servaddr, 0, sizeof(servaddr));
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port = htons(1234);
+    // Generate key pairs
+    printf("[CA] CMD_GEN_KEY: Ensuring RSA keypair exists...\n");
+    res = TEEC_InvokeCommand(&sess, CMD_GEN_KEY, NULL, &err_origin);
+    if (res != TEEC_SUCCESS) errx(1, "Key generation failed");
 
-	if(bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0){
-		perror("bind failed");
-		close(sockfd);
-		return -1;
-	}
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("Socket creation failed");
+        return -1;
+    }
 
-	// 設定目標主機的資訊
-	memset(&dest_addr, 0, sizeof(dest_addr));
-	dest_addr.sin_family = AF_INET;
-	dest_addr.sin_port = htons(DEST_PORT);
-	if(inet_pton(AF_INET, DEST_IP, &dest_addr.sin_addr) <= 0){
-		perror("Invalid destination IP address");
-		return -1;
-	}
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(LISTEN_PORT);
 
-	printf("CA is running. Listening on 1234 and sending to %s:%d\n", DEST_IP, DEST_PORT);
+    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        perror("Bind failed");
+        return -1;
+    }
 
-	while(1){
-		len = sizeof(cliaddr);
-		int n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&cliaddr, &len);
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(DEST_PORT);
+    inet_pton(AF_INET, DEST_IP, &dest_addr.sin_addr);
 
-		if(n <= 0) continue;
-		buffer[n] = '\0';
+    printf("[CA] Setup complete. Forwarding NMEA with RSA signatures...\n");
 
-		// 檢查 NMEA 格式
-		if(buffer[0] != '$') continue;
+    // Get public key
+    printf("[CA] CMD_GET_PUBLIC_KEY: Exporting public key for verifier...\n");
+    memset(&op, 0, sizeof(op));
+    op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT, TEEC_MEMREF_TEMP_OUTPUT,
+                                     TEEC_NONE, TEEC_NONE);
+    op.params[0].tmpref.buffer = modulus;
+    op.params[0].tmpref.size = 256;
+    op.params[1].tmpref.buffer = exponent;
+    op.params[1].tmpref.size = 4;
 
-		/* 設定 TA 簽章參數 (Param 0: Input, Param 1: Output) */
-		memset(&op, 0, sizeof(op));
-		op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
-										 TEEC_MEMREF_TEMP_OUTPUT,
-										 TEEC_NONE, TEEC_NONE);
+    res = TEEC_InvokeCommand(&sess, CMD_GET_PUBLIC_KEY, &op, &err_origin);
+    if (res == TEEC_SUCCESS) {
+        // Send the public key to the receiver
+        uint8_t pubkey_packet[300];
+        memcpy(pubkey_packet, "PUBKEY:", 7);
+        memcpy(pubkey_packet + 7, modulus, 256);
+        memcpy(pubkey_packet + 7 + 256, exponent, 4);
+        sendto(sockfd, pubkey_packet, 7 + 256 + 4, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    }
+    else {
+        printf("[CA] Failed to get public key: 0x%x\n", res);
+    }
 
-		op.params[0].tmpref.buffer = buffer;
-		op.params[0].tmpref.size = n;
-		op.params[1].tmpref.buffer = sign_buffer;
-		op.params[1].tmpref.size = MAX_SIG_SIZE;
 
-		printf("[CA] Requesting Signature from TA...\n");
-		res = TEEC_InvokeCommand(&sess, TA_SENDER_PRINT_MSG, &op, &err_origin);
+    while (1) {
+        int n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0, NULL, NULL);
+        if (n <= 0) continue;
+        buffer[n] = '\0';
+        if (buffer[0] != '$') continue;
 
-		if(res == TEEC_SUCCESS){
-			uint32_t sig_len = op.params[1].tmpref.size;
+        memset(&op, 0, sizeof(op));
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_MEMREF_TEMP_OUTPUT,
+                                         TEEC_NONE, TEEC_NONE);
+        op.params[0].tmpref.buffer = buffer;
+        op.params[0].tmpref.size = n;
+        op.params[1].tmpref.buffer = sign_buffer;
+        op.params[1].tmpref.size = MAX_SIG_SIZE;
 
-			/* 封裝封包：原始訊息 + 分隔符 + 二進制簽章 */
-			int header_len = sprintf(final_packet, "%s\nSIGNATURE:", buffer);
-			memcpy(final_packet + header_len, sign_buffer, sig_len);
-			int total_send_size = header_len + sig_len;
+        res = TEEC_InvokeCommand(&sess, CMD_SIGN_DATA, &op, &err_origin);
 
-			/* 發送給另一台主機的 CA */
-			int send_res = sendto(sockfd, final_packet, total_send_size, 0,
-								  (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (res == TEEC_SUCCESS) {
+            uint32_t sig_len = op.params[1].tmpref.size;
 
-			if(send_res < 0){
-				perror("[CA] sendto failed");
-			}
-			else{
-				printf("[CA] Data + Signature sent to %s:%d\n", DEST_IP, DEST_PORT);
-			}
-		}
-		else{
-			printf("[CA] TA signing failed: 0x%x\n", res);
-		}
-	}
+            // 封裝封包: [NMEA] + " SIG:" + [Binary Signature]
+            memcpy(final_packet, buffer, n);
+            memcpy(final_packet + n, " SIG:", 5);
+            memcpy(final_packet + n + 5, sign_buffer, sig_len);
 
-	close(sockfd);
-	TEEC_CloseSession(&sess);
-	TEEC_FinalizeContext(&ctx);
-	return 0;
+            sendto(sockfd, final_packet, n + 5 + sig_len, 0,
+                   (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            printf("[CA] Sent signed NMEA: %.20s...\n", buffer);
+        }
+    }
+
+    close(sockfd);
+    TEEC_CloseSession(&sess);
+    TEEC_FinalizeContext(&ctx);
+    return 0;
 }
